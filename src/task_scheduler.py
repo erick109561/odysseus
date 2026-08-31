@@ -1231,6 +1231,60 @@ class TaskScheduler:
         """Execute a built-in action (no LLM needed)."""
         from src.builtin_actions import BUILTIN_ACTIONS
 
+        # MINOR-1: when container executor is enabled, dangerous host-shell actions
+        # must fail closed — they bypass the container boundary and are invalid.
+        # - ModuleNotFoundError (genuinely absent) -> allow legacy behaviour
+        # - any other ImportError (internal/transitive failure) -> fail closed
+        if task.action in ("run_script", "run_local", "ssh_command"):
+            try:
+                from src.agent_tools.container_executor import container_executor_enabled
+                if container_executor_enabled():
+                    logger.warning(
+                        "Task action '%s' blocked: host-shell execution is not permitted "
+                        "when ODYSSEUS_CONTAINER_EXECUTOR is enabled",
+                        task.action,
+                    )
+                    return (
+                        f"Action '{task.action}' is not available when "
+                        "ODYSSEUS_CONTAINER_EXECUTOR is enabled.",
+                        False,
+                    )
+            except ModuleNotFoundError as e:
+                # container_executor module itself is absent — allow legacy behaviour.
+                # But a transitive/internal ModuleNotFoundError (e.g., dependency inside
+                # container_executor) must fail closed, same as any other ImportError.
+                # e.name may be None when __import__ is patched at builtins level,
+                # or "container_executor" when importlib.import_module is used,
+                # or a transitive module name like "nonexistent.internal" when
+                # container_executor exists but a dep inside it fails.
+                if e.name == "src.agent_tools.container_executor":
+                    pass  # allow legacy
+                else:
+                    # Transitive/internal failure — fail closed
+                    logger.warning(
+                        "Task action '%s' cannot be verified for container executor: "
+                        "transient import failure (%s) — blocking host-shell execution",
+                        task.action, e.name,
+                    )
+                    return (
+                        f"Action '{task.action}' is not available due to a "
+                        "configuration error (container executor).",
+                        False,
+                    )
+            except ImportError:
+                # Internal/transitive import failure in container_executor.
+                # Do NOT silently fall through to host shell — fail closed.
+                logger.warning(
+                    "Task action '%s' cannot be verified for container executor: "
+                    "transient import failure — blocking host-shell execution",
+                    task.action,
+                )
+                return (
+                    f"Action '{task.action}' is not available due to a "
+                    "configuration error (container executor).",
+                    False,
+                )
+
         action_fn = BUILTIN_ACTIONS.get(task.action)
         if not action_fn:
             return f"Unknown action: {task.action}", False

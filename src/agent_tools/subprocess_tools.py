@@ -7,6 +7,73 @@ import time
 import collections
 from typing import Optional, Callable, Awaitable, Tuple, Dict
 from src.constants import MAX_OUTPUT_CHARS
+from src.agent_tools.container_executor import (
+    container_executor_enabled,
+    run_container_command,
+)
+
+
+def _sanitize_error_message(message: str) -> str:
+    """
+    Redact credential canaries from exception/error messages.
+
+    Covers all forms that may appear in error messages:
+      - key=value forms: token=, secret=, password=, key=, auth=, credential=, api_key=, etc.
+      - Authorization: Bearer TOKEN forms
+      - --flag VALUE forms (--password, --token, --secret, etc.)
+      - URL-embedded credentials: https://user:TOKEN@host
+      - GitHub PATs: github_pat_*, ghp_*, etc.
+      - Base64-like tokens (20+ chars with allowed dash/underscore)
+    """
+    import re
+
+    # Pattern 1: key=value forms where key contains sensitive keywords
+    message = re.sub(
+        r"(token|secret|password|key|auth|credential|api[_-]?key|github[_-]?pat)[=:\s]+[^\s,]+",
+        r"\1=<redacted>",
+        message,
+        flags=re.I,
+    )
+
+    # Pattern 2: Authorization: Bearer TOKEN forms
+    message = re.sub(
+        r"Authorization:\s*Bearer\s+[A-Za-z0-9_.-]+",
+        "Authorization: Bearer <redacted>",
+        message,
+        flags=re.I,
+    )
+
+    # Pattern 3: --flag VALUE forms
+    message = re.sub(
+        r"--(?:password|token|secret|auth|credential)[=\s]+[^\s]+",
+        "--<redacted> <redacted>",
+        message,
+        flags=re.I,
+    )
+
+    # Pattern 4: URL-embedded credentials
+    message = re.sub(
+        r"[A-Za-z0-9+./:-]+://[^@]+:[^@]+@[^@\s]+",
+        "https://<redacted>@<redacted>",
+        message,
+    )
+
+    # Pattern 5: GitHub PAT forms (github_pat_*, ghp_*)
+    message = re.sub(
+        r"(?:github[_-]?pat|ghp_)[A-Za-z0-9_.-]{10,}",
+        "<redacted>",
+        message,
+    )
+
+    # Pattern 6: Generic base64-like tokens (20+ chars, allows dash/underscore)
+    message = re.sub(
+        r"[A-Za-z0-9+=/_.-]{20,}={0,2}",
+        "<redacted>",
+        message,
+    )
+
+    return message
+
 
 DEFAULT_BASH_TIMEOUT = 60 * 60     # 1 hour
 DEFAULT_PYTHON_TIMEOUT = 60 * 60
@@ -280,6 +347,45 @@ class BashTool:
         progress_cb = ctx.get("progress_cb")
         _subproc_env = ctx.get("subproc_env")
         session_id = ctx.get("session_id")
+
+        if container_executor_enabled():
+            try:
+                stdout, stderr, rc, timed_out = await run_container_command(
+                    workspace=agent_cwd(),
+                    command=["/bin/bash", "--noprofile", "--norc", "-c", content],
+                    timeout=DEFAULT_BASH_TIMEOUT,
+                    progress_cb=progress_cb,
+                )
+            except Exception as e:
+                error_str = _sanitize_error_message(str(e))
+                return {
+                    "error": f"bash: container executor error — {error_str}",
+                    "exit_code": 1,
+                }
+            if timed_out:
+                return {
+                    "error": (
+                        f"bash: timed out after {DEFAULT_BASH_TIMEOUT}s "
+                        "— container destroyed"
+                    ),
+                    "exit_code": 124,
+                    "stdout": _truncate(stdout, MAX_OUTPUT_CHARS),
+                    "stderr": _truncate(stderr, MAX_OUTPUT_CHARS),
+                }
+            output = stdout.rstrip()
+            err = stderr.rstrip()
+            if err:
+                output = (
+                    (output + "\nSTDERR: " + err).strip()
+                    if output
+                    else "STDERR: " + err
+                )
+            output = _truncate(output, MAX_OUTPUT_CHARS)
+            return {
+                "output": output or "(no output)",
+                "exit_code": rc or 0,
+            }
+
         if session_id and shutil.which("tmux"):
             stdout, stderr, rc, timed_out = await _run_tmux_bash(
                 content,
@@ -333,6 +439,45 @@ class PythonTool:
         from src.tool_execution import agent_cwd, _truncate
         progress_cb = ctx.get("progress_cb")
         _subproc_env = ctx.get("subproc_env")
+
+        if container_executor_enabled():
+            try:
+                stdout, stderr, rc, timed_out = await run_container_command(
+                    workspace=agent_cwd(),
+                    command=["python", "-I", "-c", content],
+                    timeout=DEFAULT_PYTHON_TIMEOUT,
+                    progress_cb=progress_cb,
+                )
+            except Exception as e:
+                error_str = _sanitize_error_message(str(e))
+                return {
+                    "error": f"python: container executor error — {error_str}",
+                    "exit_code": 1,
+                }
+            if timed_out:
+                return {
+                    "error": (
+                        f"python: timed out after {DEFAULT_PYTHON_TIMEOUT}s "
+                        "— container destroyed"
+                    ),
+                    "exit_code": 124,
+                    "stdout": _truncate(stdout, MAX_OUTPUT_CHARS),
+                    "stderr": _truncate(stderr, MAX_OUTPUT_CHARS),
+                }
+            output = stdout.rstrip()
+            err = stderr.rstrip()
+            if err:
+                output = (
+                    (output + "\nSTDERR: " + err).strip()
+                    if output
+                    else "STDERR: " + err
+                )
+            output = _truncate(output, MAX_OUTPUT_CHARS)
+            return {
+                "output": output or "(no output)",
+                "exit_code": rc or 0,
+            }
+
         proc = await asyncio.create_subprocess_exec(
             (sys.executable or "python"), "-I", "-c", content,
             stdout=asyncio.subprocess.PIPE,
