@@ -59,7 +59,7 @@ _AGENT_WORKDIR = DATA_DIR
 # ---------------------------------------------------------------------------
 
 _SENSITIVE_BASENAMES: set[str] = {
-    ".ssh", ".gnupg", ".gitconfig",
+    ".ssh", ".gnupg", ".git", ".gitconfig",
     ".bashrc", ".bash_profile", ".bash_logout",
     ".zshrc", ".zprofile", ".zshenv",
     ".profile", ".tcshrc", ".cshrc",
@@ -716,9 +716,23 @@ async def _execute_tool_block_impl(
     # marker runs DETACHED — returns a job id immediately so the chat stream
     # isn't held open for a multi-minute install/ffmpeg/download. The always-on
     # monitor re-invokes the agent with the full output when the job finishes.
+    # BLOCKER-1: when container executor is enabled, NO background bash marker may
+    # route to host bg_jobs — that would bypass the container boundary entirely.
     if tool == "bash" and session_id:
         _is_bg, _bg_cmd = _split_bg_marker(content)
         if _is_bg and _bg_cmd:
+            from src.agent_tools.container_executor import container_executor_enabled
+            if container_executor_enabled():
+                desc = f"bash (background, container-executor): {_bg_cmd.strip().split(chr(10))[0][:80]}"
+                result = {
+                    "error": (
+                        "Background bash execution is not supported when "
+                        "ODYSSEUS_CONTAINER_EXECUTOR is enabled. "
+                        "Submit the command as a foreground bash tool call instead."
+                    ),
+                    "exit_code": 1,
+                }
+                return desc, result
             from src import bg_jobs
             rec = bg_jobs.launch(_bg_cmd, session_id=session_id, cwd=agent_cwd())
             short = _bg_cmd.strip().split(chr(10))[0][:80]
